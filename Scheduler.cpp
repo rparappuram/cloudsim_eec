@@ -6,6 +6,14 @@
 //
 
 #include "Scheduler.hpp"
+#include "Interfaces.h"
+#include "SimTypes.h"
+
+enum Algorithm {GREEDY, PMAPPER, EECO, RESEARCH}; // TODO: Placeholder - We need to research which algo we want to do
+const Algorithm CURRENT_ALGORITHM = GREEDY;
+
+// Free-standing function declarations
+void InitGreedy(vector<VMId_t>& vms, vector<MachineId_t>& machines);
 
 static bool migrating = false;
 static unsigned active_machines = 16;
@@ -21,25 +29,65 @@ void Scheduler::Init() {
     // 
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
-    for(unsigned i = 0; i < active_machines; i++)
-        vms.push_back(VM_Create(LINUX, X86));
-    for(unsigned i = 0; i < active_machines; i++) {
-        machines.push_back(MachineId_t(i));
-    }    
-    for(unsigned i = 0; i < active_machines; i++) {
-        VM_Attach(vms[i], machines[i]);
+
+    unsigned total_machines = Machine_GetTotal();
+    machines.resize(total_machines);
+    
+    switch (CURRENT_ALGORITHM) {
+        case GREEDY:
+            InitGreedy(vms, machines);
+            break;
+        case PMAPPER:
+            InitPMapper(vms, machines);
+            break;
+        case EECO:
+            InitEECO(vms, machines);
+            break;
+        case RESEARCH:
+            InitResearch(vms, machines);
+            break;
     }
 
-    bool dynamic = false;
-    if(dynamic)
-        for(unsigned i = 0; i<4 ; i++)
-            for(unsigned j = 0; j < 8; j++)
-                Machine_SetCorePerformance(MachineId_t(0), j, P3);
-    // Turn off the ARM machines
-    for(unsigned i = 24; i < Machine_GetTotal(); i++)
-        Machine_SetState(MachineId_t(i), S5);
+    // -- EXAMPLE CODE PROVIDED BY PROF --
+    // for(unsigned i = 0; i < active_machines; i++)
+    //     vms.push_back(VM_Create(LINUX, X86));
+    // for(unsigned i = 0; i < active_machines; i++) {
+    //     machines.push_back(MachineId_t(i));
+    // }    
+    // for(unsigned i = 0; i < active_machines; i++) {
+    //     VM_Attach(vms[i], machines[i]);
+    // }
 
-    SimOutput("Scheduler::Init(): VM ids are " + to_string(vms[0]) + " ahd " + to_string(vms[1]), 3);
+    // bool dynamic = false;
+    // if(dynamic)
+    //     for(unsigned i = 0; i<4 ; i++)
+    //         for(unsigned j = 0; j < 8; j++)
+    //             Machine_SetCorePerformance(MachineId_t(0), j, P3);
+    // // Turn off the ARM machines
+    // for(unsigned i = 24; i < Machine_GetTotal(); i++)
+    //     Machine_SetState(MachineId_t(i), S5);
+
+    // SimOutput("Scheduler::Init(): VM ids are " + to_string(vms[0]) + " and " + to_string(vms[1]), 3);
+}
+
+void InitGreedy(vector<VMId_t>& vms, vector<MachineId_t>& machines) {
+    SimOutput("Scheduler::InitGreedy(): Initializing Greedy algorithm", 1);
+    // TODO
+}
+
+void InitPMapper(vector<VMId_t>& vms, vector<MachineId_t>& machines) {
+    SimOutput("Scheduler::InitPMapper(): Initializing PMapper algorithm", 1);
+    // TODO
+}
+
+void InitEECO(vector<VMId_t>& vms, vector<MachineId_t>& machines) {
+    SimOutput("Scheduler::InitEECO(): Initializing EECO algorithm", 1);
+    // TODO
+}
+
+void InitResearch(vector<VMId_t>& vms, vector<MachineId_t>& machines) {
+    SimOutput("Scheduler::InitResearch(): Initializing Research algorithm", 1);
+    // TODO
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
@@ -101,21 +149,21 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 
 // Public interface below
 
-static Scheduler Scheduler;
+static Scheduler scheduler;
 
 void InitScheduler() {
     SimOutput("InitScheduler(): Initializing scheduler", 4);
-    Scheduler.Init();
+    scheduler.Init();
 }
 
 void HandleNewTask(Time_t time, TaskId_t task_id) {
     SimOutput("HandleNewTask(): Received new task " + to_string(task_id) + " at time " + to_string(time), 4);
-    Scheduler.NewTask(time, task_id);
+    scheduler.NewTask(time, task_id);
 }
 
 void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
     SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) + " completed at time " + to_string(time), 4);
-    Scheduler.TaskComplete(time, task_id);
+    scheduler.TaskComplete(time, task_id);
 }
 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
@@ -126,14 +174,14 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
 void MigrationDone(Time_t time, VMId_t vm_id) {
     // The function is called on to alert you that migration is complete
     SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
-    Scheduler.MigrationComplete(time, vm_id);
+    scheduler.MigrationComplete(time, vm_id);
     migrating = false;
 }
 
 void SchedulerCheck(Time_t time) {
     // This function is called periodically by the simulator, no specific event
     SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
-    Scheduler.PeriodicCheck(time);
+    scheduler.PeriodicCheck(time);
     static unsigned counts = 0;
     counts++;
     if(counts == 10) {
@@ -152,7 +200,7 @@ void SimulationComplete(Time_t time) {
     cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
     SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
     
-    Scheduler.Shutdown(time);
+    scheduler.Shutdown(time);
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
