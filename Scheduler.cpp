@@ -8,6 +8,7 @@
 #include "Scheduler.hpp"
 #include "Interfaces.h"
 #include "SimTypes.h"
+#include <map>
 
 enum Algorithm
 {
@@ -24,28 +25,30 @@ void InitPMapper(vector<VMId_t> &vms, vector<MachineId_t> &machines);
 void InitEECO(vector<VMId_t> &vms, vector<MachineId_t> &machines);
 void InitResearch(vector<VMId_t> &vms, vector<MachineId_t> &machines);
 
-void MigrationCompleteGreedy(Time_t time, VMId_t vm_id);
-void MigrationCompletePMapper(Time_t time, VMId_t vm_id);
-void MigrationCompleteEECO(Time_t time, VMId_t vm_id);
-void MigrationCompleteResearch(Time_t time, VMId_t vm_id);
-
-void NewTaskGreedy(Time_t now, TaskId_t task_id);
-void NewTaskPMapper(Time_t now, TaskId_t task_id);
-void NewTaskEECO(Time_t now, TaskId_t task_id);
-void NewTaskResearch(Time_t now, TaskId_t task_id);
-
-void PeriodicCheckGreedy(Time_t now);
-void PeriodicCheckPMapper(Time_t now);
-void PeriodicCheckEECO(Time_t now);
-void PeriodicCheckResearch(Time_t now);
+void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines);
+void NewTaskPMapper(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines);
+void NewTaskEECO(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines);
+void NewTaskResearch(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines);
 
 void TaskCompleteGreedy(Time_t now, TaskId_t task_id);
 void TaskCompletePMapper(Time_t now, TaskId_t task_id);
 void TaskCompleteEECO(Time_t now, TaskId_t task_id);
 void TaskCompleteResearch(Time_t now, TaskId_t task_id);
 
+void PeriodicCheckGreedy(Time_t now);
+void PeriodicCheckPMapper(Time_t now);
+void PeriodicCheckEECO(Time_t now);
+void PeriodicCheckResearch(Time_t now);
+
+void MigrationCompleteGreedy(Time_t time, VMId_t vm_id);
+void MigrationCompletePMapper(Time_t time, VMId_t vm_id);
+void MigrationCompleteEECO(Time_t time, VMId_t vm_id);
+void MigrationCompleteResearch(Time_t time, VMId_t vm_id);
+
 static bool migrating = false;
-static unsigned active_machines = 16;
+static unsigned active_machines = 16;                                                 // TODO: Maybe not needed?
+static std::map<MachineId_t, bool> waking_machines;                                   // Tracks machines transitioning to S0
+static std::map<MachineId_t, std::vector<std::pair<TaskId_t, VMType_t>>> task_queues; // Queues tasks waiting for each machine
 
 void Scheduler::Init()
 {
@@ -57,33 +60,13 @@ void Scheduler::Init()
     //      Get the number of CPUs
     //      Get if there is a GPU or not
     //
-
-    // -- EXAMPLE CODE PROVIDED BY PROF --
-    // for(unsigned i = 0; i < active_machines; i++)
-    //     vms.push_back(VM_Create(LINUX, X86));
-    // for(unsigned i = 0; i < active_machines; i++) {
-    //     machines.push_back(MachineId_t(i));
-    // }
-    // for(unsigned i = 0; i < active_machines; i++) {
-    //     VM_Attach(vms[i], machines[i]);
-    // }
-
-    // bool dynamic = false;
-    // if(dynamic)
-    //     for(unsigned i = 0; i<4 ; i++)
-    //         for(unsigned j = 0; j < 8; j++)
-    //             Machine_SetCorePerformance(MachineId_t(0), j, P3);
-    // // Turn off the ARM machines
-    // for(unsigned i = 24; i < Machine_GetTotal(); i++)
-    //     Machine_SetState(MachineId_t(i), S5);
-
-    // SimOutput("Scheduler::Init(): VM ids are " + to_string(vms[0]) + " and " + to_string(vms[1]), 3);
-
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
 
     unsigned total_machines = Machine_GetTotal();
     machines.resize(total_machines);
+    for (unsigned i = 0; i < machines.size(); i++)
+        machines[i] = MachineId_t(i);
 
     switch (CURRENT_ALGORITHM)
     {
@@ -105,7 +88,7 @@ void Scheduler::Init()
 void InitGreedy(vector<VMId_t> &vms, vector<MachineId_t> &machines)
 {
     SimOutput("Scheduler::InitGreedy(): Initializing Greedy algorithm", 1);
-    // TODO
+    // VMs created on demand in NewTaskGreedy
 }
 
 void InitPMapper(vector<VMId_t> &vms, vector<MachineId_t> &machines)
@@ -123,6 +106,111 @@ void InitEECO(vector<VMId_t> &vms, vector<MachineId_t> &machines)
 void InitResearch(vector<VMId_t> &vms, vector<MachineId_t> &machines)
 {
     SimOutput("Scheduler::InitResearch(): Initializing Research algorithm", 1);
+    // TODO
+}
+
+void Scheduler::NewTask(Time_t now, TaskId_t task_id)
+{
+    // Get the task parameters
+    //  IsGPUCapable(task_id);
+    //  GetMemory(task_id);
+    //  RequiredVMType(task_id);
+    //  RequiredSLA(task_id);
+    //  RequiredCPUType(task_id);
+    // Decide to attach the task to an existing VM,
+    //      vm.AddTask(taskid, Priority_T priority); or
+    // Create a new VM, attach the VM to a machine
+    //      VM vm(type of the VM)
+    //      vm.Attach(machine_id);
+    //      vm.AddTask(taskid, Priority_t priority) or
+    // Turn on a machine, create a new VM, attach it to the VM, then add the task
+    //
+    // Turn on a machine, migrate an existing VM from a loaded machine....
+    //
+    // Other possibilities as desired
+    switch (CURRENT_ALGORITHM)
+    {
+    case GREEDY:
+        NewTaskGreedy(now, task_id, vms, machines);
+        break;
+    case PMAPPER:
+        NewTaskPMapper(now, task_id, vms, machines);
+        break;
+    case EECO:
+        NewTaskEECO(now, task_id, vms, machines);
+        break;
+    case RESEARCH:
+        NewTaskResearch(now, task_id, vms, machines);
+        break;
+    }
+}
+
+void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines)
+{
+    SimOutput("Scheduler::NewTaskGreedy(): Received new task " + to_string(task_id) + " at time " + to_string(now), 4);
+}
+
+void NewTaskPMapper(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines)
+{
+    SimOutput("Scheduler::NewTaskPMapper(): Received new task " + to_string(task_id) + " at time " + to_string(now), 4);
+    // TODO
+}
+
+void NewTaskEECO(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines)
+{
+    SimOutput("Scheduler::NewTaskEECO(): Received new task " + to_string(task_id) + " at time " + to_string(now), 4);
+    // TODO
+}
+
+void NewTaskResearch(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines)
+{
+    SimOutput("Scheduler::NewTaskResearch(): Received new task " + to_string(task_id) + " at time " + to_string(now), 4);
+    // TODO
+}
+
+void Scheduler::TaskComplete(Time_t now, TaskId_t task_id)
+{
+    // Do any bookkeeping necessary for the data structures
+    // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
+    // This is an opportunity to make any adjustments to optimize performance/energy
+    switch (CURRENT_ALGORITHM)
+    {
+    case GREEDY:
+        TaskCompleteGreedy(now, task_id);
+        break;
+    case PMAPPER:
+        TaskCompletePMapper(now, task_id);
+        break;
+    case EECO:
+        TaskCompleteEECO(now, task_id);
+        break;
+    case RESEARCH:
+        TaskCompleteResearch(now, task_id);
+        break;
+    }
+}
+
+void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
+{
+    SimOutput("Scheduler::TaskCompleteGreedy(): Task " + to_string(task_id) + " completed at time " + to_string(now), 4);
+    // TODO
+}
+
+void TaskCompletePMapper(Time_t now, TaskId_t task_id)
+{
+    SimOutput("Scheduler::TaskCompletePMapper(): Task " + to_string(task_id) + " completed at time " + to_string(now), 4);
+    // TODO
+}
+
+void TaskCompleteEECO(Time_t now, TaskId_t task_id)
+{
+    SimOutput("Scheduler::TaskCompleteEECO(): Task " + to_string(task_id) + " completed at time " + to_string(now), 4);
+    // TODO
+}
+
+void TaskCompleteResearch(Time_t now, TaskId_t task_id)
+{
+    SimOutput("Scheduler::TaskCompleteResearch(): Task " + to_string(task_id) + " completed at time " + to_string(now), 4);
     // TODO
 }
 
@@ -170,76 +258,6 @@ void MigrationCompleteResearch(Time_t time, VMId_t vm_id)
     // TODO
 }
 
-void Scheduler::NewTask(Time_t now, TaskId_t task_id)
-{
-    // Get the task parameters
-    //  IsGPUCapable(task_id);
-    //  GetMemory(task_id);
-    //  RequiredVMType(task_id);
-    //  RequiredSLA(task_id);
-    //  RequiredCPUType(task_id);
-    // Decide to attach the task to an existing VM,
-    //      vm.AddTask(taskid, Priority_T priority); or
-    // Create a new VM, attach the VM to a machine
-    //      VM vm(type of the VM)
-    //      vm.Attach(machine_id);
-    //      vm.AddTask(taskid, Priority_t priority) or
-    // Turn on a machine, create a new VM, attach it to the VM, then add the task
-    //
-    // Turn on a machine, migrate an existing VM from a loaded machine....
-    //
-    // Other possibilities as desired
-
-    // ----- Skeleton code, you need to change it according to your algorithm -----
-    // Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
-    // if(migrating) {
-    //     VM_AddTask(vms[0], task_id, priority);
-    // }
-    // else {
-    //     VM_AddTask(vms[task_id % active_machines], task_id, priority);
-    // }
-
-    switch (CURRENT_ALGORITHM)
-    {
-    case GREEDY:
-        NewTaskGreedy(now, task_id);
-        break;
-    case PMAPPER:
-        NewTaskPMapper(now, task_id);
-        break;
-    case EECO:
-        NewTaskEECO(now, task_id);
-        break;
-    case RESEARCH:
-        NewTaskResearch(now, task_id);
-        break;
-    }
-}
-
-void NewTaskGreedy(Time_t now, TaskId_t task_id)
-{
-    SimOutput("Scheduler::NewTaskGreedy(): Received new task " + to_string(task_id) + " at time " + to_string(now), 4);
-    // TODO
-}
-
-void NewTaskPMapper(Time_t now, TaskId_t task_id)
-{
-    SimOutput("Scheduler::NewTaskPMapper(): Received new task " + to_string(task_id) + " at time " + to_string(now), 4);
-    // TODO
-}
-
-void NewTaskEECO(Time_t now, TaskId_t task_id)
-{
-    SimOutput("Scheduler::NewTaskEECO(): Received new task " + to_string(task_id) + " at time " + to_string(now), 4);
-    // TODO
-}
-
-void NewTaskResearch(Time_t now, TaskId_t task_id)
-{
-    SimOutput("Scheduler::NewTaskResearch(): Received new task " + to_string(task_id) + " at time " + to_string(now), 4);
-    // TODO
-}
-
 void Scheduler::PeriodicCheck(Time_t now)
 {
     // This method should be called from SchedulerCheck()
@@ -284,52 +302,6 @@ void PeriodicCheckEECO(Time_t now)
 void PeriodicCheckResearch(Time_t now)
 {
     SimOutput("Scheduler::PeriodicCheckResearch(): SchedulerCheck() called at " + to_string(now), 4);
-    // TODO
-}
-
-void Scheduler::TaskComplete(Time_t now, TaskId_t task_id)
-{
-    // Do any bookkeeping necessary for the data structures
-    // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
-    // This is an opportunity to make any adjustments to optimize performance/energy
-    switch (CURRENT_ALGORITHM)
-    {
-    case GREEDY:
-        TaskCompleteGreedy(now, task_id);
-        break;
-    case PMAPPER:
-        TaskCompletePMapper(now, task_id);
-        break;
-    case EECO:
-        TaskCompleteEECO(now, task_id);
-        break;
-    case RESEARCH:
-        TaskCompleteResearch(now, task_id);
-        break;
-    }
-}
-
-void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
-{
-    SimOutput("Scheduler::TaskCompleteGreedy(): Task " + to_string(task_id) + " completed at time " + to_string(now), 4);
-    // TODO
-}
-
-void TaskCompletePMapper(Time_t now, TaskId_t task_id)
-{
-    SimOutput("Scheduler::TaskCompletePMapper(): Task " + to_string(task_id) + " completed at time " + to_string(now), 4);
-    // TODO
-}
-
-void TaskCompleteEECO(Time_t now, TaskId_t task_id)
-{
-    SimOutput("Scheduler::TaskCompleteEECO(): Task " + to_string(task_id) + " completed at time " + to_string(now), 4);
-    // TODO
-}
-
-void TaskCompleteResearch(Time_t now, TaskId_t task_id)
-{
-    SimOutput("Scheduler::TaskCompleteResearch(): Task " + to_string(task_id) + " completed at time " + to_string(now), 4);
     // TODO
 }
 
@@ -421,5 +393,5 @@ void SLAWarning(Time_t time, TaskId_t task_id)
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id)
 {
-    // TODO: Called in response to an earlier request to change the state of a machine
+    // TODO: Figure out what to do
 }
