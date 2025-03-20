@@ -13,6 +13,7 @@
 #include <cassert>
 #include <climits>
 #include <algorithm>
+#include <unistd.h>
 
 enum Algorithm
 {
@@ -76,6 +77,7 @@ struct PendingMigration
     unsigned memory_impact;
 };
 static std::vector<PendingMigration> pending_migrations;
+static std::map<MachineId_t, int> pending_transition_count;
 
 // Helper functions
 static Priority_t determine_priority(TaskId_t task_id)
@@ -93,6 +95,11 @@ static Priority_t determine_priority(TaskId_t task_id)
     default:
         return LOW_PRIORITY;
     }
+}
+static void Machine_TransitionState(MachineId_t machine_id, MachineState_t state)
+{
+    Machine_SetState(machine_id, state);
+    pending_transition_count[machine_id]++;
 }
 unsigned GetProjectedMemoryUsed(MachineId_t machine_id)
 {
@@ -126,14 +133,15 @@ void Scheduler::Init()
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 1);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
 
-    vms.clear();
-    machines.clear();
-    pending_tasks.clear();
+    vms = vector<VMId_t>();
+    machines = vector<MachineId_t>();
+    pending_tasks = vector<TaskId_t>();
+    pending_migrations = vector<PendingMigration>();
+    pending_transition_count = map<MachineId_t, int>();
     unsigned total_machines = Machine_GetTotal();
-    machines.resize(total_machines);
-    for (unsigned i = 0; i < machines.size(); i++)
+    for (unsigned i = 0; i < total_machines; i++)
     {
-        machines[i] = MachineId_t(i);
+        machines.push_back(MachineId_t(i));
     }
 
     switch (CURRENT_ALGORITHM)
@@ -162,26 +170,8 @@ void InitGreedy(vector<VMId_t> &vms, vector<MachineId_t> &machines)
     SimOutput("Scheduler::InitGreedy(): Initializing Greedy algorithm", 1);
     for (unsigned i = 0; i < machines.size(); i++)
     {
-        Machine_SetState(machines[i], S5); // Start with all machines off
+        Machine_TransitionState(machines[i], S5); // Start with all machines off
     }
-    // wait until all machines are in S5
-    bool allOff = false;
-    while (!allOff)
-    {
-        allOff = true;
-        for (unsigned i = 0; i < machines.size(); i++)
-        {
-            MachineInfo_t machine_info = Machine_GetInfo(machines[i]);
-            if (machine_info.s_state != S5)
-            {
-                SimOutput("Scheduler::InitGreedy(): Machine " + to_string(machines[i]) + " is not off", 1);
-                allOff = false;
-                break;
-            }
-        }
-    }
-
-    SimOutput("Scheduler::InitGreedy(): All machines are off", 1);
     // VMs created on demand in NewTaskGreedy
 }
 
@@ -247,10 +237,10 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<Mac
     2) If no VM, find suitable machine, if found: create VM, attach
     3) If no machine, turn on machine, create VM, attach
     */
+
     SimOutput("Scheduler::NewTaskGreedy(): Received new task " + to_string(task_id) + " at time " + to_string(now), 1);
     VMType_t required_vm_type = RequiredVMType(task_id);
     CPUType_t required_cpu_type = RequiredCPUType(task_id);
-    bool gpu_capable = IsTaskGPUCapable(task_id);
     unsigned task_memory = GetTaskMemory(task_id);
     Priority_t priority = determine_priority(task_id);
 
@@ -262,20 +252,24 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<Mac
         VMInfo_t vm_info = VM_GetInfo(vm_id);
         // Check if the VM is compatible with the task
         if (vm_info.vm_type == required_vm_type &&
-            vm_info.cpu == required_cpu_type &&
-            Machine_GetInfo(vm_info.machine_id).gpus == gpu_capable)
+            vm_info.cpu == required_cpu_type)
         {
             // Check if machine has space for the task
-            MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
-            unsigned total_load = machine_info.memory_used + task_memory;
-            float u_plus_v = (float)total_load / machine_info.memory_size;
-            if (machine_info.s_state == S0 && u_plus_v < 1.0f)
+            MachineId_t machine_id = vm_info.machine_id;
+            MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+            // Check if machine is stable: S0 and no pending transitions
+            if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0)
             {
-                unsigned remaining = machine_info.memory_size - machine_info.memory_used;
-                if (remaining < min_remaining_memory)
-                { // Find machine with highest utilization
-                    min_remaining_memory = remaining;
-                    suitable_vm = vm_id;
+                unsigned total_load = machine_info.memory_used + task_memory;
+                float u_plus_v = (float)total_load / machine_info.memory_size;
+                if (u_plus_v < 1.0f)
+                {
+                    unsigned remaining = machine_info.memory_size - machine_info.memory_used;
+                    if (remaining < min_remaining_memory)
+                    {
+                        min_remaining_memory = remaining;
+                        suitable_vm = vm_id;
+                    }
                 }
             }
         }
@@ -295,16 +289,19 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<Mac
     for (auto machine_id : machines)
     {
         // Check if machine can handle launching new VM and adding task
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        unsigned total_load = machine_info.memory_used + VM_MEMORY_OVERHEAD + task_memory;
-        float u_plus_v = (float)total_load / machine_info.memory_size;
-        if (machine_info.s_state == S0 && machine_info.cpu == required_cpu_type && u_plus_v < 1.0f)
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);// Check if machine is stable: S0 and no pending transitions
+        if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0 && machine_info.cpu == required_cpu_type)
         {
-            unsigned remaining = machine_info.memory_size - machine_info.memory_used;
-            if (remaining < min_remaining_memory)
-            { // Find machine with highest utilization
-                min_remaining_memory = remaining;
-                suitable_machine = machine_id;
+            unsigned total_load = machine_info.memory_used + VM_MEMORY_OVERHEAD + task_memory;
+            float u_plus_v = (float)total_load / machine_info.memory_size;
+            if (u_plus_v < 1.0f)
+            {
+                unsigned remaining = machine_info.memory_size - machine_info.memory_used;
+                if (remaining < min_remaining_memory)
+                {
+                    min_remaining_memory = remaining;
+                    suitable_machine = machine_id;
+                }
             }
         }
     }
@@ -325,7 +322,7 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<Mac
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
         if (machine_info.s_state == S5 && machine_info.cpu == required_cpu_type)
         {
-            Machine_SetState(machine_id, S0);
+            Machine_TransitionState(machine_id, S0);
             pending_tasks.push_back(task_id);
             SimOutput("Scheduler::NewTaskGreedy(): Turning on machine " + to_string(machine_id) + " for task " + to_string(task_id), 1);
             return;
@@ -442,7 +439,6 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
         {
             VMInfo_t vm_info = VM_GetInfo(vm_id);
             CPUType_t cpu_type = vm_info.cpu;
-            bool gpu_capable = Machine_GetInfo(vm_info.machine_id).gpus;
             unsigned vm_memory = 0;
             for (auto tid : vm_info.active_tasks)
             {
@@ -458,8 +454,7 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
                 unsigned projected_memory = GetProjectedMemoryUsed(target_machine);
                 unsigned total_load = projected_memory + vm_memory;
                 float target_u_plus_v = (float)total_load / target_info.memory_size;
-                if (target_info.s_state == S0 && target_info.cpu == cpu_type &&
-                    target_info.gpus == gpu_capable && target_u_plus_v < 1.0f)
+                if (target_info.s_state == S0 && target_info.cpu == cpu_type && target_u_plus_v < 1.0f)
                 {
                     // Initiate migration and track it
                     VM_Migrate(vm_id, target_machine);
@@ -476,7 +471,7 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
         unsigned projected_memory = GetProjectedMemoryUsed(machine_id);
         if (projected_memory == 0)
         {
-            Machine_SetState(machine_id, S5);
+            Machine_TransitionState(machine_id, S5);
             SimOutput("Scheduler::TaskCompleteGreedy(): Turning off machine " + to_string(machine_id), 1);
         }
     }
@@ -606,7 +601,7 @@ void PeriodicCheckGreedy(Time_t now)
             assert(machine_info.active_vms == 0);
             if (machine_info.active_vms == 0)
             {
-                Machine_SetState(machine_id, S5);
+                Machine_TransitionState(machine_id, S5);
                 SimOutput("Scheduler::PeriodicCheckGreedy(): Turning off machine " + to_string(machine_id), 3);
             }
         }
@@ -805,7 +800,6 @@ void SLAWarningGreedy(Time_t time, TaskId_t task_id)
     VMInfo_t vm_info = VM_GetInfo(current_vm);
     unsigned task_memory = GetTaskMemory(task_id);
     CPUType_t cpu_type = vm_info.cpu;
-    bool gpu_capable = Machine_GetInfo(vm_info.machine_id).gpus;
 
     // Sort machines by utilization
     vector<pair<MachineId_t, float>> machine_utils;
@@ -827,7 +821,7 @@ void SLAWarningGreedy(Time_t time, TaskId_t task_id)
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
         unsigned total_load = machine_info.memory_used + task_memory + VM_MEMORY_OVERHEAD;
         float u_plus_v = (float)total_load / machine_info.memory_size;
-        if (machine_info.cpu == cpu_type && machine_info.gpus == gpu_capable && u_plus_v < 1.0f)
+        if (machine_info.cpu == cpu_type && u_plus_v < 1.0f)
         {
             // Check to see if there's a VM already on this machine that can take the task
             for (auto vm_id : *p_vms)
@@ -858,7 +852,7 @@ void SLAWarningGreedy(Time_t time, TaskId_t task_id)
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
         if (machine_info.s_state == S5 && machine_info.cpu == cpu_type)
         {
-            Machine_SetState(machine_id, S0);
+            Machine_TransitionState(machine_id, S0);
             pending_tasks.push_back(task_id);
             VM_RemoveTask(current_vm, task_id);
             SimOutput("SLAWarning(): Turning on machine " + to_string(machine_id) + " for task " + to_string(task_id), 1);
@@ -904,7 +898,15 @@ void StateChangeCompleteGreedy(Time_t time, MachineId_t machine_id)
 {
     MachineInfo_t machine_info = Machine_GetInfo(machine_id);
     SimOutput("StateChangeCompleteGreedy(): Machine " + to_string(machine_id) + " state changed to " + to_string(machine_info.s_state) + " at time " + to_string(time), 1);
-    if (machine_info.s_state == S0)
+
+    // Decrement the pending transition count if it exists and is positive
+    if (pending_transition_count.find(machine_id) != pending_transition_count.end() && pending_transition_count[machine_id] > 0)
+    {
+        pending_transition_count[machine_id]--;
+    }
+    
+    // Place tasks only if machine is stable (S0 and no pending transitions)
+    if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0)
     {
         // Place all pending tasks on a machine WITH matching properties
         vector<TaskId_t> placed_tasks;
@@ -912,7 +914,6 @@ void StateChangeCompleteGreedy(Time_t time, MachineId_t machine_id)
         {
             VMType_t required_vm_type = RequiredVMType(tid);
             CPUType_t required_cpu_type = RequiredCPUType(tid);
-            bool gpu_capable = IsTaskGPUCapable(tid);
             unsigned task_memory = GetTaskMemory(tid);
             Priority_t priority = determine_priority(tid);
 
@@ -922,7 +923,7 @@ void StateChangeCompleteGreedy(Time_t time, MachineId_t machine_id)
             for (auto vm_id : *p_vms)
             {
                 VMInfo_t vm_info = VM_GetInfo(vm_id);
-                if (vm_info.vm_type == required_vm_type && vm_info.cpu == required_cpu_type && Machine_GetInfo(vm_info.machine_id).gpus == gpu_capable)
+                if (vm_info.vm_type == required_vm_type && vm_info.cpu == required_cpu_type)
                 {
                     MachineInfo_t minfo = Machine_GetInfo(vm_info.machine_id);
                     unsigned total_load = minfo.memory_used + task_memory;
@@ -948,7 +949,7 @@ void StateChangeCompleteGreedy(Time_t time, MachineId_t machine_id)
                 continue;
             }
 
-            // If no suitable VM is found, create a new VM on the machine we just turned on
+            // If no suitable VM is found, create a new VM on the stable machine
             MachineInfo_t minfo = Machine_GetInfo(machine_id);
             unsigned total_load = minfo.memory_used + VM_MEMORY_OVERHEAD + task_memory;
             float u_plus_v = (float)total_load / minfo.memory_size;
