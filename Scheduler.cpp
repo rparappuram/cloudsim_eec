@@ -15,6 +15,9 @@
 #include <algorithm>
 #include <unistd.h>
 
+#define MAX_UTIL 1.0f
+#define MIN_ACTIVE_MACHINES 16
+
 enum Algorithm
 {
     GREEDY,
@@ -168,7 +171,7 @@ void Scheduler::Init()
 void InitGreedy(vector<VMId_t> &vms, vector<MachineId_t> &machines)
 {
     SimOutput("Scheduler::InitGreedy(): Initializing Greedy algorithm", 1);
-    for (unsigned i = 1; i < machines.size(); i++)
+    for (unsigned i = MIN_ACTIVE_MACHINES; i < machines.size(); i++)
     {
         Machine_TransitionState(machines[i], S5); // Start with all machines off
     }
@@ -263,7 +266,7 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<Mac
             {
                 unsigned total_load = machine_info.memory_used + task_memory;
                 float u_plus_v = (float)total_load / machine_info.memory_size;
-                if (u_plus_v < 1.0f)
+                if (u_plus_v < MAX_UTIL)
                 {
                     unsigned remaining = machine_info.memory_size - machine_info.memory_used;
                     if (remaining < min_remaining_memory)
@@ -295,7 +298,7 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<Mac
         {
             unsigned total_load = machine_info.memory_used + VM_MEMORY_OVERHEAD + task_memory;
             float u_plus_v = (float)total_load / machine_info.memory_size;
-            if (u_plus_v < 1.0f)
+            if (u_plus_v < MAX_UTIL)
             {
                 unsigned remaining = machine_info.memory_size - machine_info.memory_used;
                 if (remaining < min_remaining_memory)
@@ -455,7 +458,7 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
                 unsigned projected_memory = GetProjectedMemoryUsed(target_machine);
                 unsigned total_load = projected_memory + vm_memory;
                 float target_u_plus_v = (float)total_load / target_info.memory_size;
-                if (target_info.s_state == S0 && target_info.cpu == cpu_type && target_u_plus_v < 1.0f)
+                if (target_info.s_state == S0 && target_info.cpu == cpu_type && target_u_plus_v < MAX_UTIL)
                 {
                     // Initiate migration and track it
                     VM_Migrate(vm_id, target_machine);
@@ -470,7 +473,7 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
 
         // Check if machine is now empty (considering pending migrations)
         unsigned projected_memory = GetProjectedMemoryUsed(machine_id);
-        if (projected_memory == 0)
+        if (projected_memory == 0 && machine_id >= MIN_ACTIVE_MACHINES)
         {
             Machine_TransitionState(machine_id, S5);
             SimOutput("Scheduler::TaskCompleteGreedy(): Turning off machine " + to_string(machine_id), 1);
@@ -585,11 +588,29 @@ void PeriodicCheckGreedy(Time_t now)
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
         if (machine_info.s_state == S0 && machine_info.active_tasks == 0)
         {
+            bool shutdown = true;
+
             for (auto it = p_vms->begin(); it != p_vms->end();)
             {
                 VMInfo_t vm_info = VM_GetInfo(*it);
                 if (vm_info.machine_id == machine_id && vm_info.active_tasks.empty())
                 {
+                    // Check if VM is migrating
+                    for (auto &migration : pending_migrations)
+                    {
+                        if (migration.vm_id == *it)
+                        {
+                            SimOutput("Scheduler::PeriodicCheckGreedy(): VM " + to_string(*it) + " is migrating, skipping shutdown", 1);
+                            shutdown = false;
+                            break;
+                        }
+                    }
+                    if (!shutdown)
+                    {
+                        break;
+                    }
+                    
+                    SimOutput("Scheduler::PeriodicCheckGreedy(): Shutting down VM " + to_string(*it), 1);
                     VM_Shutdown(*it);
                     it = p_vms->erase(it);
                 }
@@ -598,9 +619,10 @@ void PeriodicCheckGreedy(Time_t now)
                     ++it;
                 }
             }
+
             machine_info = Machine_GetInfo(machine_id); // Refresh info
             assert(machine_info.active_vms == 0);
-            if (machine_info.active_vms == 0 && machine_id != 0)
+            if (machine_info.active_vms == 0 && machine_id >= MIN_ACTIVE_MACHINES)
             {
                 Machine_TransitionState(machine_id, S5);
                 SimOutput("Scheduler::PeriodicCheckGreedy(): Turning off machine " + to_string(machine_id), 3);
@@ -822,7 +844,7 @@ void SLAWarningGreedy(Time_t time, TaskId_t task_id)
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
         unsigned total_load = machine_info.memory_used + task_memory + VM_MEMORY_OVERHEAD;
         float u_plus_v = (float)total_load / machine_info.memory_size;
-        if (machine_info.cpu == cpu_type && u_plus_v < 1.0f)
+        if (machine_info.cpu == cpu_type && u_plus_v < MAX_UTIL)
         {
             // Check to see if there's a VM already on this machine that can take the task
             for (auto vm_id : *p_vms)
@@ -929,7 +951,7 @@ void StateChangeCompleteGreedy(Time_t time, MachineId_t machine_id)
                     MachineInfo_t minfo = Machine_GetInfo(vm_info.machine_id);
                     unsigned total_load = minfo.memory_used + task_memory;
                     float u_plus_v = (float)total_load / minfo.memory_size;
-                    if (minfo.s_state == S0 && u_plus_v < 1.0f)
+                    if (minfo.s_state == S0 && u_plus_v < MAX_UTIL)
                     {
                         unsigned remaining = minfo.memory_size - minfo.memory_used;
                         if (remaining < min_remaining_memory)
@@ -954,7 +976,7 @@ void StateChangeCompleteGreedy(Time_t time, MachineId_t machine_id)
             MachineInfo_t minfo = Machine_GetInfo(machine_id);
             unsigned total_load = minfo.memory_used + VM_MEMORY_OVERHEAD + task_memory;
             float u_plus_v = (float)total_load / minfo.memory_size;
-            if (minfo.cpu == required_cpu_type && u_plus_v < 1.0f)
+            if (minfo.cpu == required_cpu_type && u_plus_v < MAX_UTIL)
             {
                 VMId_t new_vm = VM_Create(required_vm_type, required_cpu_type);
                 VM_Attach(new_vm, machine_id);
