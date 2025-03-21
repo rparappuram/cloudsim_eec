@@ -123,6 +123,99 @@ unsigned GetProjectedMemoryUsed(MachineId_t machine_id)
     return projected_memory;
 }
 
+// Find a suitable VM to place a task on
+static VMId_t FindSuitableVM(TaskId_t task_id, VMType_t vm_type, CPUType_t cpu_type, unsigned task_memory)
+{
+    VMId_t suitable_vm = VMId_t(-1);
+    unsigned min_remaining_memory = UINT_MAX;
+    for (auto vm_id : *p_vms)
+    {
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        if (vm_info.vm_type == vm_type && vm_info.cpu == cpu_type)
+        {
+            MachineId_t machine_id = vm_info.machine_id;
+            MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+            if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0)
+            {
+                unsigned total_load = GetProjectedMemoryUsed(machine_id) + task_memory;
+                float u_plus_v = (float)total_load / machine_info.memory_size;
+                if (u_plus_v < MAX_UTIL)
+                {
+                    unsigned remaining = machine_info.memory_size - GetProjectedMemoryUsed(machine_id);
+                    if (remaining < min_remaining_memory)
+                    {
+                        min_remaining_memory = remaining;
+                        suitable_vm = vm_id;
+                    }
+                }
+            }
+        }
+    }
+    return suitable_vm;
+}
+
+// Find a suitable physical machine to place a VM on
+static MachineId_t FindSuitableMachine(CPUType_t cpu_type, unsigned required_memory)
+{
+    MachineId_t suitable_machine = MachineId_t(-1);
+    unsigned min_remaining_memory = UINT_MAX;
+    for (auto machine_id : *p_machines)
+    {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0 && machine_info.cpu == cpu_type)
+        {
+            unsigned total_load = GetProjectedMemoryUsed(machine_id) + required_memory;
+            float u_plus_v = (float)total_load / machine_info.memory_size;
+            if (u_plus_v < MAX_UTIL)
+            {
+                unsigned remaining = machine_info.memory_size - GetProjectedMemoryUsed(machine_id);
+                if (remaining < min_remaining_memory)
+                {
+                    min_remaining_memory = remaining;
+                    suitable_machine = machine_id;
+                }
+            }
+        }
+    }
+    return suitable_machine;
+}
+
+// Activate a powered-off machine of a certain CPU type and set its state
+static MachineId_t ActivatePhysicalMachine(CPUType_t cpu_type, MachineState_t state)
+{
+    for (auto machine_id : *p_machines)
+    {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        if (machine_info.s_state == S5 && machine_info.cpu == cpu_type)
+        {
+            Machine_TransitionState(machine_id, state);
+            return machine_id;
+        }
+    }
+    return MachineId_t(-1);
+}
+
+// Get a list of the machines in S0 sorted by ascending utilization
+static vector<pair<MachineId_t, float>> GetSortedMachineUtilizations()
+{
+    vector<pair<MachineId_t, float>> machine_utils;
+    for (auto machine_id : *p_machines)
+    {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        if (machine_info.s_state == S0)
+        {
+            unsigned projected_memory = GetProjectedMemoryUsed(machine_id);
+            float u = (float)projected_memory / machine_info.memory_size;
+            machine_utils.emplace_back(machine_id, u);
+        }
+    }
+    sort(machine_utils.begin(), machine_utils.end(), 
+         [](const pair<MachineId_t, float> &a, const pair<MachineId_t, float> &b) {
+             return a.second < b.second;
+         });
+    return machine_utils;
+}
+
 void Scheduler::Init()
 {
     // Find the parameters of the clusters
@@ -248,37 +341,9 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id)
     Priority_t priority = determine_priority(task_id);
 
     // Find suitable VM
-    VMId_t suitable_vm = VMId_t(-1);
-    unsigned min_remaining_memory = UINT_MAX;
-    for (auto vm_id : *p_vms)
-    {
-        VMInfo_t vm_info = VM_GetInfo(vm_id);
-        // Check if the VM is compatible with the task
-        if (vm_info.vm_type == required_vm_type &&
-            vm_info.cpu == required_cpu_type)
-        {
-            // Check if machine has space for the task
-            MachineId_t machine_id = vm_info.machine_id;
-            MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-            // Check if machine is stable: S0 and no pending transitions
-            if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0)
-            {
-                unsigned total_load = machine_info.memory_used + task_memory;
-                float u_plus_v = (float)total_load / machine_info.memory_size;
-                if (u_plus_v < MAX_UTIL)
-                {
-                    unsigned remaining = machine_info.memory_size - machine_info.memory_used;
-                    if (remaining < min_remaining_memory)
-                    {
-                        min_remaining_memory = remaining;
-                        suitable_vm = vm_id;
-                    }
-                }
-            }
-        }
-    }
+    VMId_t suitable_vm = FindSuitableVM(task_id, required_vm_type, required_cpu_type, task_memory);
 
-    // If suitable VM found, add task to VM
+    // If suitable VM found, add task to VM and return
     if (suitable_vm != VMId_t(-1))
     {
         VM_AddTask(suitable_vm, task_id, priority);
@@ -286,29 +351,10 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id)
         return;
     }
 
-    // No suitable VM found, now find suitable machine to create VM
-    MachineId_t suitable_machine = MachineId_t(-1);
-    min_remaining_memory = UINT_MAX;
-    for (auto machine_id : *p_machines)
-    {
-        // Check if machine can handle launching new VM and adding task
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);// Check if machine is stable: S0 and no pending transitions
-        if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0 && machine_info.cpu == required_cpu_type)
-        {
-            unsigned total_load = machine_info.memory_used + VM_MEMORY_OVERHEAD + task_memory;
-            float u_plus_v = (float)total_load / machine_info.memory_size;
-            if (u_plus_v < MAX_UTIL)
-            {
-                unsigned remaining = machine_info.memory_size - machine_info.memory_used;
-                if (remaining < min_remaining_memory)
-                {
-                    min_remaining_memory = remaining;
-                    suitable_machine = machine_id;
-                }
-            }
-        }
-    }
-
+    // Otherwise, find suitable PM for new VM
+    MachineId_t suitable_machine = FindSuitableMachine(required_cpu_type, task_memory);
+    
+    // If suitable PM found, create new VM, attach to machine, and return
     if (suitable_machine != MachineId_t(-1))
     {
         VMId_t new_vm = VM_Create(required_vm_type, required_cpu_type);
@@ -319,18 +365,101 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id)
         return;
     }
 
-    // No suitable VM or machine found; turn on new machine, change state to S0, then wait for StateChangeComplete to add task
-    for (auto machine_id : *p_machines)
+    // Otherwise, turn on an inactive PM
+    MachineId_t new_machine = ActivatePhysicalMachine(required_cpu_type, S0);
+
+    // If new PM turned on, add task to pending list
+    if (new_machine != MachineId_t(-1))
     {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state == S5 && machine_info.cpu == required_cpu_type)
-        {
-            Machine_TransitionState(machine_id, S0);
-            pending_tasks.push_back(task_id);
-            SimOutput("Scheduler::NewTaskGreedy(): Turning on machine " + to_string(machine_id) + " for task " + to_string(task_id), 1);
-            return;
-        }
+        pending_tasks.push_back(task_id);
+        SimOutput("Scheduler::NewTaskGreedy(): Turning on machine " + to_string(new_machine) + " for task " + to_string(task_id), 1);
+        return;
     }
+
+    // // Find suitable VM
+    // VMId_t suitable_vm = VMId_t(-1);
+    // unsigned min_remaining_memory = UINT_MAX;
+    // for (auto vm_id : *p_vms)
+    // {
+    //     VMInfo_t vm_info = VM_GetInfo(vm_id);
+    //     // Check if the VM is compatible with the task
+    //     if (vm_info.vm_type == required_vm_type &&
+    //         vm_info.cpu == required_cpu_type)
+    //     {
+    //         // Check if machine has space for the task
+    //         MachineId_t machine_id = vm_info.machine_id;
+    //         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    //         // Check if machine is stable: S0 and no pending transitions
+    //         if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0)
+    //         {
+    //             unsigned total_load = machine_info.memory_used + task_memory;
+    //             float u_plus_v = (float)total_load / machine_info.memory_size;
+    //             if (u_plus_v < MAX_UTIL)
+    //             {
+    //                 unsigned remaining = machine_info.memory_size - machine_info.memory_used;
+    //                 if (remaining < min_remaining_memory)
+    //                 {
+    //                     min_remaining_memory = remaining;
+    //                     suitable_vm = vm_id;
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+
+    // // If suitable VM found, add task to VM
+    // if (suitable_vm != VMId_t(-1))
+    // {
+    //     VM_AddTask(suitable_vm, task_id, priority);
+    //     SimOutput("Scheduler::NewTaskGreedy(): Task " + to_string(task_id) + " placed on VM " + to_string(suitable_vm), 1);
+    //     return;
+    // }
+
+    // // No suitable VM found, now find suitable machine to create VM
+    // MachineId_t suitable_machine = MachineId_t(-1);
+    // min_remaining_memory = UINT_MAX;
+    // for (auto machine_id : *p_machines)
+    // {
+    //     // Check if machine can handle launching new VM and adding task
+    //     MachineInfo_t machine_info = Machine_GetInfo(machine_id);// Check if machine is stable: S0 and no pending transitions
+    //     if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0 && machine_info.cpu == required_cpu_type)
+    //     {
+    //         unsigned total_load = machine_info.memory_used + VM_MEMORY_OVERHEAD + task_memory;
+    //         float u_plus_v = (float)total_load / machine_info.memory_size;
+    //         if (u_plus_v < MAX_UTIL)
+    //         {
+    //             unsigned remaining = machine_info.memory_size - machine_info.memory_used;
+    //             if (remaining < min_remaining_memory)
+    //             {
+    //                 min_remaining_memory = remaining;
+    //                 suitable_machine = machine_id;
+    //             }
+    //         }
+    //     }
+    // }
+
+    // if (suitable_machine != MachineId_t(-1))
+    // {
+    //     VMId_t new_vm = VM_Create(required_vm_type, required_cpu_type);
+    //     VM_Attach(new_vm, suitable_machine);
+    //     VM_AddTask(new_vm, task_id, priority);
+    //     p_vms->push_back(new_vm);
+    //     SimOutput("Scheduler::NewTaskGreedy(): Task " + to_string(task_id) + " placed on new VM " + to_string(new_vm) + " on machine " + to_string(suitable_machine), 1);
+    //     return;
+    // }
+
+    // // No suitable VM or machine found; turn on new machine, change state to S0, then wait for StateChangeComplete to add task
+    // for (auto machine_id : *p_machines)
+    // {
+    //     MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    //     if (machine_info.s_state == S5 && machine_info.cpu == required_cpu_type)
+    //     {
+    //         Machine_TransitionState(machine_id, S0);
+    //         pending_tasks.push_back(task_id);
+    //         SimOutput("Scheduler::NewTaskGreedy(): Turning on machine " + to_string(machine_id) + " for task " + to_string(task_id), 1);
+    //         return;
+    //     }
+    // }
 
     ThrowException("Scheduler::NewTaskGreedy(): No machine available for task " + to_string(task_id) + ", SLA violation", 1);
 }
@@ -379,20 +508,8 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
 {
     SimOutput("Scheduler::TaskCompleteGreedy(): Task " + to_string(task_id) + " completed at time " + to_string(now), 1);
 
-    // Sort machines by projected utilization
-    vector<pair<MachineId_t, float>> machine_utils;
-    for (auto machine_id : *p_machines)
-    {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state == S0)
-        {
-            unsigned projected_memory = GetProjectedMemoryUsed(machine_id);
-            float u = (float)projected_memory / machine_info.memory_size;
-            machine_utils.emplace_back(machine_id, u);
-        }
-    }
-    sort(machine_utils.begin(), machine_utils.end(), [](const pair<MachineId_t, float> &a, const pair<MachineId_t, float> &b)
-         { return a.second < b.second; });
+    // Get PMs sorted by ascending utilization
+    vector<pair<MachineId_t, float>> machine_utils = GetSortedMachineUtilizations();
 
     // Consolidate by migrating VMs from low-utilization machines
     for (size_t j = 0; j < machine_utils.size(); j++)
@@ -400,7 +517,10 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
         MachineId_t machine_id = machine_utils[j].first;
         float u = machine_utils[j].second;
         if (u == 0.0f)
-            continue; // Skip empty machines
+        {
+            // Skip empty machines
+            continue;
+        }
 
         // Skip machines with pending incoming migrations
         bool has_incoming = false;
@@ -413,7 +533,9 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
             }
         }
         if (has_incoming)
+        {
             continue;
+        }
 
         // Collect VMs not currently migrating
         vector<VMId_t> vms_to_migrate;
@@ -438,19 +560,15 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
             }
         }
 
+        // Migrate VMs to higher-utilization machines
         for (auto vm_id : vms_to_migrate)
         {
             VMInfo_t vm_info = VM_GetInfo(vm_id);
             CPUType_t cpu_type = vm_info.cpu;
             unsigned vm_memory = 0;
-            for (auto tid : vm_info.active_tasks)
-            {
-                vm_memory += GetTaskMemory(tid);
-            }
-            vm_memory += VM_MEMORY_OVERHEAD;
 
             // Find a target machine with higher utilization
-            for (size_t k = j + 1; k < machine_utils.size(); k++)
+            for (size_t k = j+1 ; k < machine_utils.size(); k++)
             {
                 MachineId_t target_machine = machine_utils[k].first;
                 MachineInfo_t target_info = Machine_GetInfo(target_machine);
@@ -478,6 +596,106 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
             SimOutput("Scheduler::TaskCompleteGreedy(): Turning off machine " + to_string(machine_id), 1);
         }
     }
+
+    // // Sort machines by projected utilization
+    // vector<pair<MachineId_t, float>> machine_utils;
+    // for (auto machine_id : *p_machines)
+    // {
+    //     MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    //     if (machine_info.s_state == S0)
+    //     {
+    //         unsigned projected_memory = GetProjectedMemoryUsed(machine_id);
+    //         float u = (float)projected_memory / machine_info.memory_size;
+    //         machine_utils.emplace_back(machine_id, u);
+    //     }
+    // }
+    // sort(machine_utils.begin(), machine_utils.end(), [](const pair<MachineId_t, float> &a, const pair<MachineId_t, float> &b)
+    //      { return a.second < b.second; });
+
+    // // Consolidate by migrating VMs from low-utilization machines
+    // for (size_t j = 0; j < machine_utils.size(); j++)
+    // {
+    //     MachineId_t machine_id = machine_utils[j].first;
+    //     float u = machine_utils[j].second;
+    //     if (u == 0.0f)
+    //         continue; // Skip empty machines
+
+    //     // Skip machines with pending incoming migrations
+    //     bool has_incoming = false;
+    //     for (const auto &migration : pending_migrations)
+    //     {
+    //         if (migration.target_machine == machine_id)
+    //         {
+    //             has_incoming = true;
+    //             break;
+    //         }
+    //     }
+    //     if (has_incoming)
+    //         continue;
+
+    //     // Collect VMs not currently migrating
+    //     vector<VMId_t> vms_to_migrate;
+    //     for (auto vm_id : *p_vms)
+    //     {
+    //         VMInfo_t vm_info = VM_GetInfo(vm_id);
+    //         if (vm_info.machine_id == machine_id)
+    //         {
+    //             bool is_migrating = false;
+    //             for (const auto &migration : pending_migrations)
+    //             {
+    //                 if (migration.vm_id == vm_id)
+    //                 {
+    //                     is_migrating = true;
+    //                     break;
+    //                 }
+    //             }
+    //             if (!is_migrating)
+    //             {
+    //                 vms_to_migrate.push_back(vm_id);
+    //             }
+    //         }
+    //     }
+
+    //     for (auto vm_id : vms_to_migrate)
+    //     {
+    //         VMInfo_t vm_info = VM_GetInfo(vm_id);
+    //         CPUType_t cpu_type = vm_info.cpu;
+    //         unsigned vm_memory = 0;
+    //         for (auto tid : vm_info.active_tasks)
+    //         {
+    //             vm_memory += GetTaskMemory(tid);
+    //         }
+    //         vm_memory += VM_MEMORY_OVERHEAD;
+
+    //         // Find a target machine with higher utilization
+    //         for (size_t k = j + 1; k < machine_utils.size(); k++)
+    //         {
+    //             MachineId_t target_machine = machine_utils[k].first;
+    //             MachineInfo_t target_info = Machine_GetInfo(target_machine);
+    //             unsigned projected_memory = GetProjectedMemoryUsed(target_machine);
+    //             unsigned total_load = projected_memory + vm_memory;
+    //             float target_u_plus_v = (float)total_load / target_info.memory_size;
+    //             if (target_info.s_state == S0 && target_info.cpu == cpu_type && target_u_plus_v < MAX_UTIL)
+    //             {
+    //                 // Initiate migration and track it
+    //                 VM_Migrate(vm_id, target_machine);
+    //                 pending_migrations.push_back({vm_id, machine_id, target_machine, vm_memory});
+    //                 SimOutput("Scheduler::TaskCompleteGreedy(): Migrating VM " + to_string(vm_id) +
+    //                               " from machine " + to_string(machine_id) + " to " + to_string(target_machine),
+    //                           1);
+    //                 break; // Move to next VM
+    //             }
+    //         }
+    //     }
+
+    //     // Check if machine is now empty (considering pending migrations)
+    //     unsigned projected_memory = GetProjectedMemoryUsed(machine_id);
+    //     if (projected_memory == 0 && machine_id >= MIN_ACTIVE_MACHINES)
+    //     {
+    //         Machine_TransitionState(machine_id, S5);
+    //         SimOutput("Scheduler::TaskCompleteGreedy(): Turning off machine " + to_string(machine_id), 1);
+    //     }
+    // }
 }
 
 void TaskCompletePMapper(Time_t now, TaskId_t task_id)
@@ -589,6 +807,7 @@ void PeriodicCheckGreedy(Time_t now)
         {
             bool shutdown = true;
 
+            // Check if any VMs can be shut down
             for (auto it = p_vms->begin(); it != p_vms->end();)
             {
                 VMInfo_t vm_info = VM_GetInfo(*it);
@@ -604,11 +823,14 @@ void PeriodicCheckGreedy(Time_t now)
                             break;
                         }
                     }
+
+                    // If VM is migrating, abort PM shutdown
                     if (!shutdown)
                     {
                         break;
                     }
                     
+                    // Otherwise, shut down VM
                     SimOutput("Scheduler::PeriodicCheckGreedy(): Shutting down VM " + to_string(*it), 1);
                     VM_Shutdown(*it);
                     it = p_vms->erase(it);
