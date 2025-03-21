@@ -168,10 +168,11 @@ void Scheduler::Init()
 void InitGreedy(vector<VMId_t> &vms, vector<MachineId_t> &machines)
 {
     SimOutput("Scheduler::InitGreedy(): Initializing Greedy algorithm", 1);
-    for (unsigned i = 0; i < machines.size(); i++)
+    for (unsigned i = 1; i < machines.size(); i++)
     {
         Machine_TransitionState(machines[i], S5); // Start with all machines off
     }
+
     // VMs created on demand in NewTaskGreedy
 }
 
@@ -599,7 +600,7 @@ void PeriodicCheckGreedy(Time_t now)
             }
             machine_info = Machine_GetInfo(machine_id); // Refresh info
             assert(machine_info.active_vms == 0);
-            if (machine_info.active_vms == 0)
+            if (machine_info.active_vms == 0 && machine_id != 0)
             {
                 Machine_TransitionState(machine_id, S5);
                 SimOutput("Scheduler::PeriodicCheckGreedy(): Turning off machine " + to_string(machine_id), 3);
