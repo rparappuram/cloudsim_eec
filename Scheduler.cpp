@@ -16,7 +16,6 @@
 #include <unistd.h>
 
 #define MAX_UTIL 1.0f
-#define MIN_ACTIVE_MACHINES 16
 
 enum Algorithm
 {
@@ -68,7 +67,9 @@ void MemoryWarningPMapper(Time_t time, MachineId_t machine_id);
 void MemoryWarningEECO(Time_t time, MachineId_t machine_id);
 void MemoryWarningResearch(Time_t time, MachineId_t machine_id);
 
-// Static variables for Greedy algorithm state
+// Static variables
+static unsigned MIN_ACTIVE_MACHINES_GREEDY;
+static unsigned MIN_ACTIVE_MACHINES_PER_CLASS_PMAPPER;
 static vector<TaskId_t> pending_tasks;
 static vector<VMId_t> *p_vms = nullptr;
 static vector<MachineId_t> *p_machines = nullptr;
@@ -81,6 +82,9 @@ struct PendingMigration
 };
 static std::vector<PendingMigration> pending_migrations;
 static std::map<MachineId_t, int> pending_transition_count;
+
+// PMapper Static Variables
+std::map<std::pair<CPUType_t, bool>, std::vector<MachineId_t>> sorted_classes;
 
 // Helper functions
 static Priority_t determine_priority(TaskId_t task_id)
@@ -136,6 +140,8 @@ void Scheduler::Init()
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 1);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
 
+    MIN_ACTIVE_MACHINES_GREEDY = 16;
+    MIN_ACTIVE_MACHINES_PER_CLASS_PMAPPER = 2; // otherwise we sla violate on every migration
     vms = vector<VMId_t>();
     machines = vector<MachineId_t>();
     p_vms = &vms;
@@ -143,11 +149,6 @@ void Scheduler::Init()
     pending_tasks = vector<TaskId_t>();
     pending_migrations = vector<PendingMigration>();
     pending_transition_count = map<MachineId_t, int>();
-    unsigned total_machines = Machine_GetTotal();
-    for (unsigned i = 0; i < total_machines; i++)
-    {
-        machines.push_back(MachineId_t(i));
-    }
 
     switch (CURRENT_ALGORITHM)
     {
@@ -155,7 +156,7 @@ void Scheduler::Init()
         InitGreedy();
         break;
     case PMAPPER:
-        InitPMapper();
+
         break;
     case EECO:
         InitEECO();
@@ -170,18 +171,85 @@ void InitGreedy()
 {
     SimOutput("Scheduler::InitGreedy(): Initializing Greedy algorithm", 1);
     // turn off all machines using p_machines
-    for (unsigned i = MIN_ACTIVE_MACHINES; i < p_machines->size(); i++)
+    unsigned total_machines = Machine_GetTotal();
+    for (unsigned i = 0; i < total_machines; i++)
     {
-        Machine_TransitionState((*p_machines)[i], S5);
+        p_machines->push_back(i);
+        if (i >= MIN_ACTIVE_MACHINES_GREEDY)
+        {
+            Machine_TransitionState(i, S5);
+        }
     }
-
     // VMs created on demand in NewTaskGreedy
 }
 
 void InitPMapper()
 {
     SimOutput("Scheduler::InitPMapper(): Initializing PMapper algorithm", 1);
-    // TODO
+
+    // Store power usage of each machine in a map
+    unsigned total_machines = Machine_GetTotal();
+    static std::map<MachineId_t, double> machine_power_consumption;
+    for (unsigned i = 0; i < total_machines; i++)
+    {
+        MachineId_t machine_id = MachineId_t(i);
+        p_machines->push_back(machine_id);
+        MachineInfo_t minfo = Machine_GetInfo(machine_id);
+        double power = static_cast<double>(minfo.s_states[0]) + (minfo.num_cpus * minfo.p_states[0]);
+        machine_power_consumption[machine_id] = power;
+    }
+
+    // Identify machine classes
+    std::map<std::pair<CPUType_t, bool>, std::vector<MachineId_t>> machine_classes;
+    for (auto machine_id : *p_machines)
+    {
+        MachineInfo_t info = Machine_GetInfo(machine_id);
+        std::pair<CPUType_t, bool> key = {info.cpu, info.gpus};
+        machine_classes[key].push_back(machine_id);
+    }
+
+    // Sort each machine class by power consumption
+    for (auto &[key, machines] : machine_classes)
+    {
+        sorted_classes[key] = machines;
+        std::sort(sorted_classes[key].begin(), sorted_classes[key].end(),
+                  [&](MachineId_t a, MachineId_t b)
+                  {
+                      return machine_power_consumption[a] < machine_power_consumption[b];
+                  });
+    }
+
+    // Compute number of machines to leave on per class
+    unsigned MIN_PER_CLASS = MIN_ACTIVE_MACHINES_PER_CLASS_PMAPPER;
+
+    // Identify which machines to keep active
+    std::set<MachineId_t> machines_to_keep_active;
+    for (auto &[key, machines] : sorted_classes)
+    {
+        size_t num_to_keep = std::min(static_cast<size_t>(MIN_PER_CLASS), machines.size());
+        for (size_t i = 0; i < num_to_keep; ++i)
+        {
+            MachineId_t machine_id = machines[i];
+            machines_to_keep_active.insert(machine_id);
+            SimOutput("InitPMapper(): Keeping machine " + to_string(machine_id) + " active for class (CPU: " +
+                          to_string(static_cast<int>(key.first)) + ", GPU: " + (key.second ? "yes" : "no") + ")",
+                      1);
+        }
+    }
+
+    // Deactivate all other machines
+    for (auto machine_id : *p_machines)
+    {
+        if (machines_to_keep_active.find(machine_id) == machines_to_keep_active.end())
+        {
+            MachineInfo_t info = Machine_GetInfo(machine_id);
+            std::pair<CPUType_t, bool> key = {info.cpu, info.gpus > 0};
+            Machine_TransitionState(machine_id, S5);
+            SimOutput("InitPMapper(): Deactivating machine " + to_string(machine_id) + " for class (CPU: " +
+                          to_string(static_cast<int>(key.first)) + ", GPU: " + (key.second ? "yes" : "no") + ")",
+                      1);
+        }
+    }
 }
 
 void InitEECO()
@@ -292,7 +360,7 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id)
     for (auto machine_id : *p_machines)
     {
         // Check if machine can handle launching new VM and adding task
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);// Check if machine is stable: S0 and no pending transitions
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id); // Check if machine is stable: S0 and no pending transitions
         if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0 && machine_info.cpu == required_cpu_type)
         {
             unsigned total_load = machine_info.memory_used + VM_MEMORY_OVERHEAD + task_memory;
@@ -323,22 +391,131 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id)
     for (auto machine_id : *p_machines)
     {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state == S5 && machine_info.cpu == required_cpu_type)
+        if (machine_info.cpu == required_cpu_type)
         {
-            Machine_TransitionState(machine_id, S0);
+            if ((machine_info.s_state == S5 && pending_transition_count[machine_id] == 0) || (machine_info.s_state == S0 && pending_transition_count[machine_id] == 1))
+            {
+                Machine_TransitionState(machine_id, S0);
+                SimOutput("Scheduler::NewTaskGreedy(): Turning on machine " + to_string(machine_id) + " for task " + to_string(task_id), 1);
+            }
             pending_tasks.push_back(task_id);
-            SimOutput("Scheduler::NewTaskGreedy(): Turning on machine " + to_string(machine_id) + " for task " + to_string(task_id), 1);
             return;
         }
     }
-
     ThrowException("Scheduler::NewTaskGreedy(): No machine available for task " + to_string(task_id) + ", SLA violation", 1);
 }
 
 void NewTaskPMapper(Time_t now, TaskId_t task_id)
 {
-    SimOutput("Scheduler::NewTaskPMapper(): Received new task " + to_string(task_id) + " at time " + to_string(now), 1);
-    // TODO
+    SimOutput("NewTaskPMapper: Task " + to_string(task_id) + " arrived at " + to_string(now), 1);
+
+    // Get task requirements
+    VMType_t required_vm_type = RequiredVMType(task_id);
+    CPUType_t required_cpu_type = RequiredCPUType(task_id);
+    bool gpu_capable = IsTaskGPUCapable(task_id);
+    unsigned task_memory = GetTaskMemory(task_id);
+    Priority_t priority = determine_priority(task_id);
+
+    // Define preferred and fallback classes based on GPU capability
+    std::pair<CPUType_t, bool> preferred_key = {required_cpu_type, gpu_capable};
+    std::pair<CPUType_t, bool> fallback_key = {required_cpu_type, !gpu_capable};
+
+    // Check if classes exist in the system
+    bool preferred_exists = sorted_classes.find(preferred_key) != sorted_classes.end();
+    bool fallback_exists = sorted_classes.find(fallback_key) != sorted_classes.end();
+
+    if (!preferred_exists && !fallback_exists)
+    {
+        ThrowException("No machines available for CPU type " + to_string(required_cpu_type), 1);
+    }
+
+    // Lambda to attempt task placement in a given class
+    auto try_place_in_class = [&](const std::pair<CPUType_t, bool> &class_key) -> bool
+    {
+        std::vector<MachineId_t> &machines_in_class = sorted_classes[class_key];
+        for (auto machine_id : machines_in_class)
+        {
+            MachineInfo_t minfo = Machine_GetInfo(machine_id);
+            if (minfo.s_state != S0 && pending_transition_count[machine_id] > 0) // Only consider stable machines
+                continue;
+
+            // Try existing VMs
+            for (auto vm_id : *p_vms)
+            {
+                VMInfo_t vminfo = VM_GetInfo(vm_id);
+                if (vminfo.machine_id == machine_id &&
+                    vminfo.vm_type == required_vm_type &&
+                    vminfo.cpu == required_cpu_type)
+                {
+                    unsigned projected_memory = GetProjectedMemoryUsed(machine_id);
+                    if (projected_memory + task_memory <= minfo.memory_size)
+                    {
+                        VM_AddTask(vm_id, task_id, priority);
+                        SimOutput("Placed task " + to_string(task_id) + " on existing VM " +
+                                      to_string(vm_id) + " on machine " + to_string(machine_id),
+                                  1);
+                        return true;
+                    }
+                }
+            }
+
+            // Try creating a new VM
+            unsigned total_load = GetProjectedMemoryUsed(machine_id) + VM_MEMORY_OVERHEAD + task_memory;
+            if (total_load <= minfo.memory_size)
+            {
+                VMId_t new_vm = VM_Create(required_vm_type, required_cpu_type);
+                VM_Attach(new_vm, machine_id);
+                VM_AddTask(new_vm, task_id, priority);
+                p_vms->push_back(new_vm);
+                SimOutput("Placed task " + to_string(task_id) + " on new VM " +
+                              to_string(new_vm) + " on machine " + to_string(machine_id),
+                          1);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Attempt placement in preferred class
+    if (preferred_exists && try_place_in_class(preferred_key))
+        return;
+
+    // Attempt placement in fallback class
+    if (fallback_exists && try_place_in_class(fallback_key))
+        return;
+
+    // Lambda to activate a standby machine in a given class
+    auto activate_machine = [&](const std::pair<CPUType_t, bool> &class_key) -> bool
+    {
+        if (sorted_classes.find(class_key) == sorted_classes.end())
+            return false;
+
+        std::vector<MachineId_t> &machines_in_class = sorted_classes[class_key];
+        for (auto machine_id : machines_in_class)
+        {
+            MachineInfo_t minfo = Machine_GetInfo(machine_id);
+            if (minfo.s_state == S5) // Standby state
+            {
+                Machine_TransitionState(machine_id, S0);
+                pending_tasks.push_back(task_id);
+                SimOutput("Turning on machine " + to_string(machine_id) +
+                              " for task " + to_string(task_id),
+                          1);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Try activating a preferred-class machine
+    if (preferred_exists && activate_machine(preferred_key))
+        return;
+
+    // Try activating a fallback-class machine
+    if (fallback_exists && activate_machine(fallback_key))
+        return;
+
+    ThrowException("No machine available for task " + to_string(task_id) + ", SLA violation", 1);
 }
 
 void NewTaskEECO(Time_t now, TaskId_t task_id)
@@ -472,7 +649,7 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
 
         // Check if machine is now empty (considering pending migrations)
         unsigned projected_memory = GetProjectedMemoryUsed(machine_id);
-        if (projected_memory == 0 && machine_id >= MIN_ACTIVE_MACHINES)
+        if (projected_memory == 0 && machine_id >= MIN_ACTIVE_MACHINES_GREEDY)
         {
             Machine_TransitionState(machine_id, S5);
             SimOutput("Scheduler::TaskCompleteGreedy(): Turning off machine " + to_string(machine_id), 1);
@@ -482,8 +659,115 @@ void TaskCompleteGreedy(Time_t now, TaskId_t task_id)
 
 void TaskCompletePMapper(Time_t now, TaskId_t task_id)
 {
-    SimOutput("Scheduler::TaskCompletePMapper(): Task " + to_string(task_id) + " completed at time " + to_string(now), 1);
-    // TODO
+    // Log the task completion event
+    SimOutput("TaskCompletePMapper: Task " + to_string(task_id) + " completed at " + to_string(now), 1);
+
+    // Step 1: Identify active machines
+    std::vector<MachineId_t> active_machines;
+    for (auto machine_id : *p_machines)
+    {
+        MachineInfo_t minfo = Machine_GetInfo(machine_id);
+        if (minfo.s_state == S0 && pending_transition_count[machine_id] == 0) // Stable machine
+        {
+            active_machines.push_back(machine_id);
+        }
+    }
+    if (active_machines.empty())
+        return; // No active machines to process
+
+    // Step 2: Calculate utilization for each active machine
+    std::vector<std::pair<MachineId_t, float>> machine_utils;
+    for (auto machine_id : active_machines)
+    {
+        MachineInfo_t minfo = Machine_GetInfo(machine_id);
+        unsigned projected_memory = GetProjectedMemoryUsed(machine_id);
+        float u = (float)projected_memory / minfo.memory_size; // Utilization as a fraction
+        machine_utils.emplace_back(machine_id, u);
+    }
+
+    // Step 3: Sort machines by utilization in ascending order
+    std::sort(machine_utils.begin(), machine_utils.end(),
+              [](const std::pair<MachineId_t, float> &a, const std::pair<MachineId_t, float> &b)
+              {
+                  return a.second < b.second;
+              });
+
+    // Step 4: Split into lower and upper halves
+    size_t split = machine_utils.size() / 2;
+    std::vector<MachineId_t> lower_half, upper_half;
+    for (size_t i = 0; i < machine_utils.size(); i++)
+    {
+        if (i < split)
+            lower_half.push_back(machine_utils[i].first); // Underutilized machines
+        else
+            upper_half.push_back(machine_utils[i].first); // Highly utilized machines
+    }
+
+    // Step 5: Migrate VMs from lower half to upper half
+    for (auto source_machine : lower_half)
+    {
+        // Get VMs on the source machine
+        std::vector<VMId_t> vms_on_machine;
+        for (auto vm_id : *p_vms)
+        {
+            VMInfo_t vminfo = VM_GetInfo(vm_id);
+            if (vminfo.machine_id == source_machine)
+            {
+                vms_on_machine.push_back(vm_id);
+            }
+        }
+
+        for (auto vm_id : vms_on_machine)
+        {
+            VMInfo_t vminfo = VM_GetInfo(vm_id);
+            CPUType_t cpu_type = vminfo.cpu;
+            unsigned vm_memory = VM_MEMORY_OVERHEAD; // Base memory overhead for the VM
+            for (auto tid : vminfo.active_tasks)
+            {
+                vm_memory += GetTaskMemory(tid); // Add memory for each active task
+            }
+
+            // Try to migrate to a machine in the upper half with the same CPU type
+            for (auto target_machine : upper_half)
+            {
+                MachineInfo_t target_info = Machine_GetInfo(target_machine);
+                if (target_info.cpu == cpu_type) // Ensure CPU compatibility
+                {
+                    unsigned projected_memory = GetProjectedMemoryUsed(target_machine);
+                    if (projected_memory + vm_memory <= target_info.memory_size) // Check memory capacity
+                    {
+                        // Check if the VM is not already migrating
+                        bool is_migrating = false;
+                        for (auto &migration : pending_migrations)
+                        {
+                            if (migration.vm_id == vm_id)
+                            {
+                                is_migrating = true;
+                                break;
+                            }
+                        }
+                        if (!is_migrating)
+                        {
+                            // Perform the migration
+                            VM_Migrate(vm_id, target_machine);
+                            pending_migrations.push_back({vm_id, source_machine, target_machine, vm_memory});
+                            SimOutput("Migrating VM " + to_string(vm_id) + " from " +
+                                          to_string(source_machine) + " to " + to_string(target_machine),
+                                      1);
+                            break; // Move to the next VM
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 6: Turn off the source machine if it becomes empty
+        if (GetProjectedMemoryUsed(source_machine) == 0)
+        {
+            Machine_TransitionState(source_machine, S5); // S5 indicates an off state
+            SimOutput("Turning off machine " + to_string(source_machine), 1);
+        }
+    }
 }
 
 void TaskCompleteEECO(Time_t now, TaskId_t task_id)
@@ -539,8 +823,21 @@ void MigrationCompleteGreedy(Time_t time, VMId_t vm_id)
 
 void MigrationCompletePMapper(Time_t time, VMId_t vm_id)
 {
-    SimOutput("Scheduler::MigrationCompletePMapper(): Migration of VM " + to_string(vm_id) + " completed at time " + to_string(time), 1);
-    // TODO
+    // Log the migration completion
+    SimOutput("MigrationCompletePMapper: Migration of VM " + to_string(vm_id) + " completed at " + to_string(time), 1);
+
+    // Remove the completed migration from the pending list
+    for (auto it = pending_migrations.begin(); it != pending_migrations.end();)
+    {
+        if (it->vm_id == vm_id)
+        {
+            it = pending_migrations.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
 }
 
 void MigrationCompleteEECO(Time_t time, VMId_t vm_id)
@@ -585,7 +882,7 @@ void PeriodicCheckGreedy(Time_t now)
     for (auto machine_id : *p_machines)
     {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state == S0 && machine_info.active_tasks == 0)
+        if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0 && machine_info.active_vms == 0)
         {
             bool shutdown = true;
 
@@ -608,7 +905,7 @@ void PeriodicCheckGreedy(Time_t now)
                     {
                         break;
                     }
-                    
+
                     SimOutput("Scheduler::PeriodicCheckGreedy(): Shutting down VM " + to_string(*it), 1);
                     VM_Shutdown(*it);
                     it = p_vms->erase(it);
@@ -621,10 +918,10 @@ void PeriodicCheckGreedy(Time_t now)
 
             machine_info = Machine_GetInfo(machine_id); // Refresh info
             assert(machine_info.active_vms == 0);
-            if (machine_info.active_vms == 0 && machine_id >= MIN_ACTIVE_MACHINES)
+            if (machine_info.active_vms == 0 && machine_id >= MIN_ACTIVE_MACHINES_GREEDY)
             {
+                SimOutput("Scheduler::PeriodicCheckGreedy(): Turning off machine " + to_string(machine_id), 1);
                 Machine_TransitionState(machine_id, S5);
-                SimOutput("Scheduler::PeriodicCheckGreedy(): Turning off machine " + to_string(machine_id), 3);
             }
         }
     }
@@ -632,8 +929,83 @@ void PeriodicCheckGreedy(Time_t now)
 
 void PeriodicCheckPMapper(Time_t now)
 {
-    SimOutput("Scheduler::PeriodicCheckPMapper(): SchedulerCheck() called at " + to_string(now), 1);
-    // TODO
+    SimOutput("Scheduler::PeriodicCheckPMapper(): SchedulerCheck() called at " + to_string(now), 3);
+
+    // Step 1: Track active machine counts per class
+    std::map<std::pair<CPUType_t, bool>, unsigned> active_machine_counts;
+    for (const auto &[class_key, machines] : sorted_classes)
+    {
+        unsigned count = 0;
+        for (auto machine_id : sorted_classes[class_key])
+        {
+            MachineInfo_t minfo = Machine_GetInfo(machine_id);
+            if (minfo.s_state == S0)
+            {
+                count++;
+            }
+        }
+        active_machine_counts[class_key] = count;
+    }
+
+    // Step 2: Iterate through all machines
+    for (auto machine_id : *p_machines)
+    {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0 && machine_info.active_vms == 0)
+        {
+            bool shutdown = true;
+
+            // Step 3: Check and shut down VMs on the machine
+            for (auto it = p_vms->begin(); it != p_vms->end();)
+            {
+                VMInfo_t vm_info = VM_GetInfo(*it);
+                if (vm_info.machine_id == machine_id && vm_info.active_tasks.empty())
+                {
+                    // Check if VM is migrating
+                    for (auto &migration : pending_migrations)
+                    {
+                        if (migration.vm_id == *it)
+                        {
+                            SimOutput("Scheduler::PeriodicCheckPMapper(): VM " + to_string(*it) + " is migrating, skipping shutdown", 1);
+                            shutdown = false;
+                            break;
+                        }
+                    }
+                    if (!shutdown)
+                    {
+                        break;
+                    }
+
+                    SimOutput("Scheduler::PeriodicCheckPMapper(): Shutting down VM " + to_string(*it), 1);
+                    VM_Shutdown(*it);
+                    it = p_vms->erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+
+            // Step 4: Check if machine can be turned off
+            machine_info = Machine_GetInfo(machine_id); // Refresh info
+            assert(machine_info.active_vms == 0);
+            if (machine_info.active_vms == 0)
+            {
+                MachineInfo_t minfo = Machine_GetInfo(machine_id);
+                std::pair<CPUType_t, bool> class_key = {minfo.cpu, minfo.gpus};
+                if (active_machine_counts[class_key] > MIN_ACTIVE_MACHINES_PER_CLASS_PMAPPER)
+                {
+                    SimOutput("Scheduler::PeriodicCheckPMapper(): Turning off machine " + to_string(machine_id), 1);
+                    Machine_TransitionState(machine_id, S5);
+                    active_machine_counts[class_key]--; // Update active count
+                }
+                else
+                {
+                    SimOutput("Scheduler::PeriodicCheckPMapper(): Machine " + to_string(machine_id) + " is required to meet minimum active machines per class", 1);
+                }
+            }
+        }
+    }
 }
 
 void PeriodicCheckEECO(Time_t now)
@@ -743,6 +1115,49 @@ void MemoryWarningGreedy(Time_t time, MachineId_t machine_id)
 
 void MemoryWarningPMapper(Time_t time, MachineId_t machine_id)
 {
+    SimOutput("MemoryWarningPMapper: Memory warning on machine " + to_string(machine_id) + " at " + to_string(time), 1);
+
+    // Step 1: Identify VMs on the overcommitted machine
+    std::vector<VMId_t> vms_on_machine;
+    for (auto vm_id : *p_vms)
+    {
+        VMInfo_t vminfo = VM_GetInfo(vm_id);
+        if (vminfo.machine_id == machine_id)
+        {
+            vms_on_machine.push_back(vm_id);
+        }
+    }
+
+    // Step 2: Sort VMs by memory usage (descending)
+    std::sort(vms_on_machine.begin(), vms_on_machine.end(),
+              [](VMId_t a, VMId_t b)
+              {
+                  VMInfo_t vminfo_a = VM_GetInfo(a);
+                  VMInfo_t vminfo_b = VM_GetInfo(b);
+                  unsigned memory_a = VM_MEMORY_OVERHEAD;
+                  unsigned memory_b = VM_MEMORY_OVERHEAD;
+                  for (auto tid : vminfo_a.active_tasks)
+                  {
+                      memory_a += GetTaskMemory(tid);
+                  }
+                  for (auto tid : vminfo_b.active_tasks)
+                  {
+                      memory_b += GetTaskMemory(tid);
+                  }
+                  return memory_a > memory_b;
+              });
+
+    // Step 3: Apply SLAWarningPMapper to the VM with highest memory usage
+    if (!vms_on_machine.empty())
+    {
+        VMId_t vm_id = vms_on_machine[0];
+        VMInfo_t vminfo = VM_GetInfo(vm_id);
+        for (auto tid : vminfo.active_tasks)
+        {
+            SLAWarningPMapper(time, tid);
+        }
+        SimOutput("MemoryWarningPMapper: Applied SLAWarningPMapper to VM " + to_string(vm_id) + " on machine " + to_string(machine_id), 1);
+    }
 }
 
 void MemoryWarningEECO(Time_t time, MachineId_t machine_id)
@@ -872,9 +1287,12 @@ void SLAWarningGreedy(Time_t time, TaskId_t task_id)
     for (auto machine_id : *p_machines)
     {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state == S5 && machine_info.cpu == cpu_type)
+        if (machine_info.cpu == cpu_type)
         {
-            Machine_TransitionState(machine_id, S0);
+            if (machine_info.s_state == S5 && pending_transition_count[machine_id] == 0)
+            {
+                Machine_TransitionState(machine_id, S0);
+            }
             pending_tasks.push_back(task_id);
             VM_RemoveTask(current_vm, task_id);
             SimOutput("SLAWarning(): Turning on machine " + to_string(machine_id) + " for task " + to_string(task_id), 1);
@@ -887,6 +1305,89 @@ void SLAWarningGreedy(Time_t time, TaskId_t task_id)
 
 void SLAWarningPMapper(Time_t time, TaskId_t task_id)
 {
+    SimOutput("SLAWarningPMapper: Task " + to_string(task_id) + " violated SLA at " + to_string(time), 1);
+
+    // Step 1: Find the current VM and machine hosting the task
+    VMId_t current_vm = VMId_t(-1);
+    MachineId_t current_machine = MachineId_t(-1);
+    for (auto vm_id : *p_vms)
+    {
+        VMInfo_t vminfo = VM_GetInfo(vm_id);
+        if (std::find(vminfo.active_tasks.begin(), vminfo.active_tasks.end(), task_id) != vminfo.active_tasks.end())
+        {
+            current_vm = vm_id;
+            current_machine = vminfo.machine_id;
+            break;
+        }
+    }
+    if (current_vm == VMId_t(-1))
+        return; // Task not found
+
+    // Step 2: Get task requirements
+    VMType_t required_vm_type = RequiredVMType(task_id);
+    CPUType_t required_cpu_type = RequiredCPUType(task_id);
+    unsigned task_memory = GetTaskMemory(task_id);
+    Priority_t priority = determine_priority(task_id);
+
+    // Step 3: Find a suitable machine to migrate the task
+    for (auto machine_id : *p_machines)
+    {
+        if (machine_id == current_machine)
+            continue;
+
+        MachineInfo_t minfo = Machine_GetInfo(machine_id);
+        if (minfo.s_state == S0 && pending_transition_count[machine_id] == 0 && minfo.cpu == required_cpu_type)
+        {
+            // Check existing VMs on this machine
+            for (auto vm_id : *p_vms)
+            {
+                VMInfo_t vminfo = VM_GetInfo(vm_id);
+                if (vminfo.machine_id == machine_id && vminfo.vm_type == required_vm_type)
+                {
+                    unsigned projected_memory = GetProjectedMemoryUsed(machine_id);
+                    if (projected_memory + task_memory <= minfo.memory_size)
+                    {
+                        VM_AddTask(vm_id, task_id, priority);
+                        VM_RemoveTask(current_vm, task_id);
+                        SimOutput("Migrated task " + to_string(task_id) + " to VM " + to_string(vm_id) + " on machine " + to_string(machine_id), 1);
+                        return;
+                    }
+                }
+            }
+
+            // Create a new VM if no suitable VM exists
+            unsigned total_load = GetProjectedMemoryUsed(machine_id) + VM_MEMORY_OVERHEAD + task_memory;
+            if (total_load <= minfo.memory_size)
+            {
+                VMId_t new_vm = VM_Create(required_vm_type, required_cpu_type);
+                VM_Attach(new_vm, machine_id);
+                VM_AddTask(new_vm, task_id, priority);
+                VM_RemoveTask(current_vm, task_id);
+                p_vms->push_back(new_vm);
+                SimOutput("Created new VM " + to_string(new_vm) + " on machine " + to_string(machine_id) + " for task " + to_string(task_id), 1);
+                return;
+            }
+        }
+    }
+
+    // Step 4: If no machine is available, activate a standby machine
+    for (auto machine_id : *p_machines)
+    {
+        MachineInfo_t minfo = Machine_GetInfo(machine_id);
+        if (minfo.cpu == required_cpu_type)
+        {
+            if (minfo.s_state == S5 && pending_transition_count[machine_id] == 0)
+            {
+                Machine_TransitionState(machine_id, S0);
+            }
+            pending_tasks.push_back(task_id);
+            VM_RemoveTask(current_vm, task_id);
+            SimOutput("Turning on machine " + to_string(machine_id) + " for task " + to_string(task_id), 1);
+            return;
+        }
+    }
+
+    ThrowException("Failed to resolve SLA violation for task " + to_string(task_id), 0);
 }
 
 void SLAWarningEECO(Time_t time, TaskId_t task_id)
@@ -926,7 +1427,7 @@ void StateChangeCompleteGreedy(Time_t time, MachineId_t machine_id)
     {
         pending_transition_count[machine_id]--;
     }
-    
+
     // Place tasks only if machine is stable (S0 and no pending transitions)
     if (machine_info.s_state == S0 && pending_transition_count[machine_id] == 0)
     {
@@ -995,6 +1496,100 @@ void StateChangeCompleteGreedy(Time_t time, MachineId_t machine_id)
 
 void StateChangeCompletePMapper(Time_t time, MachineId_t machine_id)
 {
+    MachineInfo_t minfo = Machine_GetInfo(machine_id);
+    SimOutput("StateChangeCompletePMapper: Machine " + to_string(machine_id) + " state changed to " + to_string(minfo.s_state) + " at " + to_string(time), 1);
+
+    if (pending_transition_count.find(machine_id) != pending_transition_count.end() && pending_transition_count[machine_id] > 0)
+    {
+        pending_transition_count[machine_id]--;
+    }
+
+    if (minfo.s_state == S0 && pending_transition_count[machine_id] == 0)
+    {
+        std::vector<TaskId_t> placed_tasks;
+        for (auto tid : pending_tasks)
+        {
+            VMType_t required_vm_type = RequiredVMType(tid);
+            CPUType_t required_cpu_type = RequiredCPUType(tid);
+            unsigned task_memory = GetTaskMemory(tid);
+            Priority_t priority = determine_priority(tid);
+
+            // Try to place on existing VMs across all machines
+            VMId_t best_vm = VMId_t(-1);
+            unsigned min_remaining_memory = UINT_MAX;
+            for (auto vm_id : *p_vms)
+            {
+                VMInfo_t vminfo = VM_GetInfo(vm_id);
+                if (vminfo.vm_type == required_vm_type && vminfo.cpu == required_cpu_type)
+                {
+                    MachineInfo_t minfo = Machine_GetInfo(vminfo.machine_id);
+                    if (minfo.s_state == S0)
+                    {
+                        unsigned projected_memory = GetProjectedMemoryUsed(vminfo.machine_id);
+                        if (projected_memory + task_memory <= minfo.memory_size)
+                        {
+                            unsigned remaining = minfo.memory_size - projected_memory;
+                            if (remaining < min_remaining_memory)
+                            {
+                                min_remaining_memory = remaining;
+                                best_vm = vm_id;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (best_vm != VMId_t(-1))
+            {
+                VM_AddTask(best_vm, tid, priority);
+                placed_tasks.push_back(tid);
+                SimOutput("Placed pending task " + to_string(tid) + " on VM " + to_string(best_vm), 1);
+                continue;
+            }
+
+            // Try the newly active machine
+            MachineInfo_t minfo = Machine_GetInfo(machine_id);
+            if (minfo.cpu == required_cpu_type)
+            {
+                unsigned total_load = GetProjectedMemoryUsed(machine_id) + VM_MEMORY_OVERHEAD + task_memory;
+                if (total_load <= minfo.memory_size)
+                {
+                    VMId_t new_vm = VM_Create(required_vm_type, required_cpu_type);
+                    VM_Attach(new_vm, machine_id);
+                    VM_AddTask(new_vm, tid, priority);
+                    p_vms->push_back(new_vm);
+                    placed_tasks.push_back(tid);
+                    SimOutput("Placed pending task " + to_string(tid) + " on new VM " + to_string(new_vm) + " on machine " + to_string(machine_id), 1);
+                    continue;
+                }
+            }
+
+            // Try another active machine
+            for (auto m_id : *p_machines)
+            {
+                MachineInfo_t m_info = Machine_GetInfo(m_id);
+                if (m_info.s_state == S0 && m_info.cpu == required_cpu_type)
+                {
+                    unsigned total_load = GetProjectedMemoryUsed(m_id) + VM_MEMORY_OVERHEAD + task_memory;
+                    if (total_load <= m_info.memory_size)
+                    {
+                        VMId_t new_vm = VM_Create(required_vm_type, required_cpu_type);
+                        VM_Attach(new_vm, m_id);
+                        VM_AddTask(new_vm, tid, priority);
+                        p_vms->push_back(new_vm);
+                        placed_tasks.push_back(tid);
+                        SimOutput("Placed pending task " + to_string(tid) + " on new VM " + to_string(new_vm) + " on machine " + to_string(m_id), 1);
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (auto tid : placed_tasks)
+        {
+            pending_tasks.erase(std::remove(pending_tasks.begin(), pending_tasks.end(), tid), pending_tasks.end());
+        }
+    }
 }
 
 void StateChangeCompleteEECO(Time_t time, MachineId_t machine_id)
