@@ -28,15 +28,15 @@ enum Algorithm
 const Algorithm CURRENT_ALGORITHM = GREEDY;
 
 // Free-standing function declarations
-void InitGreedy(vector<VMId_t> &vms, vector<MachineId_t> &machines);
-void InitPMapper(vector<VMId_t> &vms, vector<MachineId_t> &machines);
-void InitEECO(vector<VMId_t> &vms, vector<MachineId_t> &machines);
-void InitResearch(vector<VMId_t> &vms, vector<MachineId_t> &machines);
+void InitGreedy();
+void InitPMapper();
+void InitEECO();
+void InitResearch();
 
-void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines);
-void NewTaskPMapper(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines);
-void NewTaskEECO(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines);
-void NewTaskResearch(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines);
+void NewTaskGreedy(Time_t now, TaskId_t task_id);
+void NewTaskPMapper(Time_t now, TaskId_t task_id);
+void NewTaskEECO(Time_t now, TaskId_t task_id);
+void NewTaskResearch(Time_t now, TaskId_t task_id);
 
 void TaskCompleteGreedy(Time_t now, TaskId_t task_id);
 void TaskCompletePMapper(Time_t now, TaskId_t task_id);
@@ -138,6 +138,8 @@ void Scheduler::Init()
 
     vms = vector<VMId_t>();
     machines = vector<MachineId_t>();
+    p_vms = &vms;
+    p_machines = &machines;
     pending_tasks = vector<TaskId_t>();
     pending_migrations = vector<PendingMigration>();
     pending_transition_count = map<MachineId_t, int>();
@@ -150,48 +152,45 @@ void Scheduler::Init()
     switch (CURRENT_ALGORITHM)
     {
     case GREEDY:
-        InitGreedy(vms, machines);
+        InitGreedy();
         break;
     case PMAPPER:
-        InitPMapper(vms, machines);
+        InitPMapper();
         break;
     case EECO:
-        InitEECO(vms, machines);
+        InitEECO();
         break;
     case RESEARCH:
-        InitResearch(vms, machines);
+        InitResearch();
         break;
     }
-
-    // Set pointers to access vms and machines outside the class
-    p_vms = &vms;
-    p_machines = &machines;
 }
 
-void InitGreedy(vector<VMId_t> &vms, vector<MachineId_t> &machines)
+void InitGreedy()
 {
     SimOutput("Scheduler::InitGreedy(): Initializing Greedy algorithm", 1);
-    for (unsigned i = MIN_ACTIVE_MACHINES; i < machines.size(); i++)
+    // turn off all machines using p_machines
+    for (unsigned i = MIN_ACTIVE_MACHINES; i < p_machines->size(); i++)
     {
-        Machine_TransitionState(machines[i], S5); // Start with all machines off
+        Machine_TransitionState((*p_machines)[i], S5);
     }
 
     // VMs created on demand in NewTaskGreedy
 }
 
-void InitPMapper(vector<VMId_t> &vms, vector<MachineId_t> &machines)
+void InitPMapper()
 {
     SimOutput("Scheduler::InitPMapper(): Initializing PMapper algorithm", 1);
     // TODO
 }
 
-void InitEECO(vector<VMId_t> &vms, vector<MachineId_t> &machines)
+void InitEECO()
 {
     SimOutput("Scheduler::InitEECO(): Initializing EECO algorithm", 1);
     // TODO
 }
 
-void InitResearch(vector<VMId_t> &vms, vector<MachineId_t> &machines)
+void InitResearch()
 {
     SimOutput("Scheduler::InitResearch(): Initializing Research algorithm", 1);
     // TODO
@@ -219,21 +218,21 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id)
     switch (CURRENT_ALGORITHM)
     {
     case GREEDY:
-        NewTaskGreedy(now, task_id, vms, machines);
+        NewTaskGreedy(now, task_id);
         break;
     case PMAPPER:
-        NewTaskPMapper(now, task_id, vms, machines);
+        NewTaskPMapper(now, task_id);
         break;
     case EECO:
-        NewTaskEECO(now, task_id, vms, machines);
+        NewTaskEECO(now, task_id);
         break;
     case RESEARCH:
-        NewTaskResearch(now, task_id, vms, machines);
+        NewTaskResearch(now, task_id);
         break;
     }
 }
 
-void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines)
+void NewTaskGreedy(Time_t now, TaskId_t task_id)
 {
     /*
     Steps:
@@ -251,7 +250,7 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<Mac
     // Find suitable VM
     VMId_t suitable_vm = VMId_t(-1);
     unsigned min_remaining_memory = UINT_MAX;
-    for (auto vm_id : vms)
+    for (auto vm_id : *p_vms)
     {
         VMInfo_t vm_info = VM_GetInfo(vm_id);
         // Check if the VM is compatible with the task
@@ -290,7 +289,7 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<Mac
     // No suitable VM found, now find suitable machine to create VM
     MachineId_t suitable_machine = MachineId_t(-1);
     min_remaining_memory = UINT_MAX;
-    for (auto machine_id : machines)
+    for (auto machine_id : *p_machines)
     {
         // Check if machine can handle launching new VM and adding task
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);// Check if machine is stable: S0 and no pending transitions
@@ -315,13 +314,13 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<Mac
         VMId_t new_vm = VM_Create(required_vm_type, required_cpu_type);
         VM_Attach(new_vm, suitable_machine);
         VM_AddTask(new_vm, task_id, priority);
-        vms.push_back(new_vm);
+        p_vms->push_back(new_vm);
         SimOutput("Scheduler::NewTaskGreedy(): Task " + to_string(task_id) + " placed on new VM " + to_string(new_vm) + " on machine " + to_string(suitable_machine), 1);
         return;
     }
 
     // No suitable VM or machine found; turn on new machine, change state to S0, then wait for StateChangeComplete to add task
-    for (auto machine_id : machines)
+    for (auto machine_id : *p_machines)
     {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
         if (machine_info.s_state == S5 && machine_info.cpu == required_cpu_type)
@@ -336,19 +335,19 @@ void NewTaskGreedy(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<Mac
     ThrowException("Scheduler::NewTaskGreedy(): No machine available for task " + to_string(task_id) + ", SLA violation", 1);
 }
 
-void NewTaskPMapper(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines)
+void NewTaskPMapper(Time_t now, TaskId_t task_id)
 {
     SimOutput("Scheduler::NewTaskPMapper(): Received new task " + to_string(task_id) + " at time " + to_string(now), 1);
     // TODO
 }
 
-void NewTaskEECO(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines)
+void NewTaskEECO(Time_t now, TaskId_t task_id)
 {
     SimOutput("Scheduler::NewTaskEECO(): Received new task " + to_string(task_id) + " at time " + to_string(now), 1);
     // TODO
 }
 
-void NewTaskResearch(Time_t now, TaskId_t task_id, vector<VMId_t> &vms, vector<MachineId_t> &machines)
+void NewTaskResearch(Time_t now, TaskId_t task_id)
 {
     SimOutput("Scheduler::NewTaskResearch(): Received new task " + to_string(task_id) + " at time " + to_string(now), 1);
     // TODO
